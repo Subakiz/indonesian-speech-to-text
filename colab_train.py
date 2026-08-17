@@ -4,15 +4,14 @@
 # This notebook fine-tunes `openai/whisper-large-v3-turbo` on Hugging Face Indonesian speech datasets using NVIDIA GPU acceleration (T4 / A100 / L4) with:
 # 1. **PEFT LoRA (All-Linear Projection Tuning)**
 # 2. **Acoustic SpecAugment & Indonesian Text Normalizer**
-# 3. **Automatic Model Packaging / Hugging Face Hub Upload**
-# 
-# Once trained, download the checkpoint to your Mac and compile it for the **Apple Neural Engine (ANE)** in 1 click!
+# 3. **Automatic Model Packaging**
 
 # %% [markdown]
-# ### Step 1: Install Dependencies
+# ### Step 1: Install & Upgrade Dependencies (including torchao fix)
 
 # %%
 !pip install -q --upgrade pip
+!pip install -q --upgrade torchao
 !pip install -q torch torchaudio transformers datasets peft accelerate evaluate jiwer soundfile librosa pyyaml
 
 # %% [markdown]
