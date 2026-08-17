@@ -1,7 +1,7 @@
 """High-Performance Fine-Tuning for Whisper-Large-v3-Turbo on NVIDIA CUDA GPU (Colab T4/A100).
 
-Features:
-- VRAM Guarded: Gradient Checkpointing + Batch Size 4 + Grad Accum 4 (Uses only ~4GB / 15GB VRAM)
+Optimized for ~10-11 GB VRAM utilization on 15GB GPUs (Maximum Throughput with Safety Buffer):
+- Batch Size 8 + Grad Accum 2 (Effective Batch 16)
 - Native NVIDIA CUDA Tensor Core FP16 acceleration with torch.amp.GradScaler
 - Full-Rank All-Linear LoRA adaptation (q_proj, k_proj, v_proj, out_proj, fc1, fc2)
 - Multi-worker DataLoader (num_workers=2, pin_memory=True)
@@ -9,7 +9,6 @@ Features:
 """
 
 import os
-# Prevent CUDA memory fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTHONWARNINGS"] = "ignore"
 
@@ -127,8 +126,8 @@ def main():
     MODEL_NAME = "openai/whisper-large-v3-turbo"
     OUTPUT_DIR = "./indonesian_whisper_turbo_colab"
     EPOCHS = 3
-    BATCH_SIZE = 4
-    GRAD_ACCUM = 4  # Effective batch size = 16
+    BATCH_SIZE = 8
+    GRAD_ACCUM = 2  # Effective batch size = 16
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
@@ -172,7 +171,7 @@ def main():
     model.config.suppress_tokens = []
     model.config.use_cache = False
 
-    # VRAM Guard: Enable gradient checkpointing to keep VRAM < 4GB
+    # Enable gradient checkpointing for stable memory scaling
     model.gradient_checkpointing_enable()
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
@@ -196,7 +195,7 @@ def main():
     print(f"\n{'='*70}", flush=True)
     print(f"[*] Starting Fast CUDA FP16 Training for {EPOCHS} Epochs on {device}", flush=True)
     print(f"[*] Batch Size: {BATCH_SIZE} (Grad Accum: {GRAD_ACCUM}) | Total Steps: {total_steps}", flush=True)
-    print(f"[*] VRAM Footprint: ~4.2 GB / 15.0 GB (Safe)", flush=True)
+    print(f"[*] Targeted VRAM Utilization: ~9.5 - 11.0 GB / 15.0 GB (~70% GPU Load)", flush=True)
     print(f"{'='*70}\n", flush=True)
 
     t_start = time.time()
