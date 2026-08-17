@@ -3,8 +3,12 @@
 import os
 import torch
 import torch.nn as nn
-import coremltools as ct
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+try:
+    import coremltools as ct
+    HAS_COREML = True
+except ImportError:
+    HAS_COREML = False
 
 
 class WhisperEncoderWrapper(nn.Module):
@@ -15,18 +19,25 @@ class WhisperEncoderWrapper(nn.Module):
         self.encoder = whisper_encoder
 
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
-        # input_features: [1, num_mel_bins, 3000]
         encoder_outputs = self.encoder(input_features)
-        # Returns last_hidden_state: [1, 1500, hidden_dim]
         return encoder_outputs.last_hidden_state
 
 
 def export_whisper_encoder_to_ane(
     model_path: str,
     output_mlpackage_path: str = "./checkpoints/WhisperEncoder_Large_Turbo_ANE.mlpackage",
-    compute_precision: ct.precision = ct.precision.FLOAT16,
+    compute_precision = None,
 ) -> str:
     """Convert Whisper Encoder (Large-v3-Turbo / Small / Tiny) to Apple Core ML (.mlpackage) optimized for ANE."""
+    if not HAS_COREML:
+        print("[!] Warning: coremltools is only available on macOS. Skipping Core ML export on Linux/Colab.")
+        print("[!] You can export to Core ML on your Mac after downloading the trained PyTorch checkpoint.")
+        return ""
+
+    from transformers import WhisperForConditionalGeneration
+    if compute_precision is None:
+        compute_precision = ct.precision.FLOAT16
+
     print(f"[*] Loading model from {model_path} for ANE export...")
     model = WhisperForConditionalGeneration.from_pretrained(model_path)
     model.eval()
@@ -37,7 +48,6 @@ def export_whisper_encoder_to_ane(
     encoder_wrapper = WhisperEncoderWrapper(model.model.encoder)
     encoder_wrapper.eval()
 
-    # Dummy input: 1 audio chunk of 30 seconds at 16kHz -> [1, num_mel_bins, 3000]
     dummy_input = torch.randn(1, num_mel_bins, 3000, dtype=torch.float32)
 
     print("[*] Tracing PyTorch Whisper Encoder module...")
@@ -64,13 +74,3 @@ def export_whisper_encoder_to_ane(
     print(f"[✓] Successfully exported ANE Core ML package to: {output_mlpackage_path}")
 
     return output_mlpackage_path
-
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="openai/whisper-large-v3-turbo")
-    parser.add_argument("--output_path", type=str, default="./checkpoints/WhisperEncoder_Large_Turbo_ANE.mlpackage")
-    args = parser.parse_args()
-
-    export_whisper_encoder_to_ane(args.model_path, args.output_path)

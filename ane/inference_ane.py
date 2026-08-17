@@ -7,10 +7,15 @@ import numpy as np
 import torch
 import soundfile as sf
 import librosa
-import coremltools as ct
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 from data.indonesian_normalizer import IndonesianTextNormalizer
+
+try:
+    import coremltools as ct
+    HAS_COREML = True
+except ImportError:
+    HAS_COREML = False
 
 
 class IndonesianANEInferenceEngine:
@@ -20,7 +25,7 @@ class IndonesianANEInferenceEngine:
         self,
         coreml_encoder_path: str = "./checkpoints/WhisperEncoder_Indonesian_Full_ANE.mlpackage",
         hf_model_path: str = "./checkpoints/indonesian_whisper_full",
-        compute_unit: ct.ComputeUnit = ct.ComputeUnit.ALL,
+        compute_unit = None,
         language: str = "indonesian",
         task: str = "transcribe",
         num_beams: int = 5,
@@ -28,14 +33,19 @@ class IndonesianANEInferenceEngine:
         self.language = language
         self.task = task
         self.num_beams = num_beams
-        
-        print(f"[*] Initializing Core ML Engine on Apple Neural Engine (Compute Units: {compute_unit.name})...")
-        t0 = time.time()
-        self.coreml_encoder = ct.models.MLModel(
-            coreml_encoder_path,
-            compute_units=compute_unit,
-        )
-        print(f"[✓] Core ML model loaded on ANE in {time.time() - t0:.3f}s")
+        self.coreml_encoder = None
+
+        if HAS_COREML and os.path.exists(coreml_encoder_path):
+            cu = compute_unit if compute_unit is not None else ct.ComputeUnit.ALL
+            print(f"[*] Initializing Core ML Engine on Apple Neural Engine...")
+            t0 = time.time()
+            self.coreml_encoder = ct.models.MLModel(
+                coreml_encoder_path,
+                compute_units=cu,
+            )
+            print(f"[✓] Core ML model loaded on ANE in {time.time() - t0:.3f}s")
+        else:
+            print("[*] Running in standard PyTorch mode (ANE Core ML model not loaded).")
 
         print(f"[*] Loading Whisper Decoder & Processor from {hf_model_path}...")
         self.processor = WhisperProcessor.from_pretrained(hf_model_path)
@@ -69,33 +79,32 @@ class IndonesianANEInferenceEngine:
         apply_normalization: bool = True,
         num_beams: Optional[int] = None,
     ) -> Dict[str, Union[str, float]]:
-        """Run speech-to-text inference with ANE acceleration and beam search."""
+        """Run speech-to-text inference with ANE / GPU acceleration and beam search."""
         t_start = time.perf_counter()
         beams = num_beams if num_beams is not None else self.num_beams
 
-        # 1. Preprocess audio
         audio_array, duration_sec = self.load_and_preprocess_audio(audio_input, sampling_rate=sampling_rate)
 
-        # 2. Extract Log-Mel Spectrogram features [1, 80, 3000]
         input_features = self.processor.feature_extractor(
             audio_array,
             sampling_rate=sampling_rate,
             return_tensors="np",
         ).input_features
 
-        # 3. Run Audio Encoder on Apple Neural Engine (ANE)
         t_ane_start = time.perf_counter()
-        ane_outputs = self.coreml_encoder.predict({"input_features": input_features})
-        ane_time_ms = (time.perf_counter() - t_ane_start) * 1000.0
+        if self.coreml_encoder is not None:
+            ane_outputs = self.coreml_encoder.predict({"input_features": input_features})
+            ane_time_ms = (time.perf_counter() - t_ane_start) * 1000.0
+            output_key = list(ane_outputs.keys())[0]
+            encoder_hidden_states = torch.tensor(ane_outputs[output_key], dtype=torch.float32)
+            encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden_states)
+        else:
+            pt_features = torch.tensor(input_features, dtype=torch.float32)
+            with torch.no_grad():
+                encoder_outputs = self.decoder_model.model.encoder(pt_features)
+            ane_time_ms = (time.perf_counter() - t_ane_start) * 1000.0
 
-        output_key = list(ane_outputs.keys())[0]
-        encoder_hidden_states_np = ane_outputs[output_key]
-        encoder_hidden_states = torch.tensor(encoder_hidden_states_np, dtype=torch.float32)
-
-        # 4. Run Autoregressive Decoder with Beam Search & Anti-Hallucination
         t_dec_start = time.perf_counter()
-        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden_states)
-
         forced_decoder_ids = self.processor.get_decoder_prompt_ids(
             language=self.language,
             task=self.task,
@@ -114,10 +123,8 @@ class IndonesianANEInferenceEngine:
         decoding_time_ms = (time.perf_counter() - t_dec_start) * 1000.0
         total_time_ms = (time.perf_counter() - t_start) * 1000.0
 
-        # 5. Decode Tokens to Indonesian Text
         transcription_raw = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
         transcription_normalized = self.normalizer(transcription_raw) if apply_normalization else transcription_raw
-
         rtf = (total_time_ms / 1000.0) / max(duration_sec, 0.001)
 
         return {
@@ -129,10 +136,5 @@ class IndonesianANEInferenceEngine:
             "decoder_latency_ms": round(decoding_time_ms, 2),
             "total_latency_ms": round(total_time_ms, 2),
             "real_time_factor_rtf": round(rtf, 4),
-            "device": "Apple Neural Engine (ANE) + CPU/Metal",
+            "device": "Apple Neural Engine (ANE)" if self.coreml_encoder else "PyTorch CUDA/CPU",
         }
-
-
-if __name__ == "__main__":
-    engine = IndonesianANEInferenceEngine()
-    print("[✓] Indonesian ANE Inference Engine with Beam Search initialized.")
