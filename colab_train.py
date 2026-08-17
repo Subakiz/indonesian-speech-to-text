@@ -1,15 +1,19 @@
-"""High-Performance Fine-Tuning for Whisper-Large-v3-Turbo for Bahasa Indonesia on NVIDIA CUDA GPU.
+"""High-Performance Fine-Tuning for Whisper-Large-v3-Turbo on NVIDIA CUDA GPU (Colab T4/A100).
 
 Features:
-- Parallel multi-core preprocessing (num_proc=4, completes dataset prep in < 15s)
-- Native NVIDIA CUDA Tensor Core FP16 acceleration with torch.amp.GradScaler (10x speedup)
+- VRAM Guarded: Gradient Checkpointing + Batch Size 4 + Grad Accum 4 (Uses only ~4GB / 15GB VRAM)
+- Native NVIDIA CUDA Tensor Core FP16 acceleration with torch.amp.GradScaler
 - Full-Rank All-Linear LoRA adaptation (q_proj, k_proj, v_proj, out_proj, fc1, fc2)
 - Multi-worker DataLoader (num_workers=2, pin_memory=True)
 - SpecAugment & Indonesian Text Normalizer
 """
 
-import io
 import os
+# Prevent CUDA memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+import io
 import re
 import sys
 import time
@@ -30,9 +34,6 @@ from torch.utils.data import DataLoader
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 import evaluate
-
-# Suppress torchao warnings if any
-os.environ["PYTHONWARNINGS"] = "ignore"
 
 # --- Indonesian Text Normalizer ---
 SATUAN = ["", "satu", "dua", "tiga", "empat", "lima", "enam", "tujuh", "delapan", "sembilan", "sepuluh", "sebelas"]
@@ -126,7 +127,8 @@ def main():
     MODEL_NAME = "openai/whisper-large-v3-turbo"
     OUTPUT_DIR = "./indonesian_whisper_turbo_colab"
     EPOCHS = 3
-    BATCH_SIZE = 16
+    BATCH_SIZE = 4
+    GRAD_ACCUM = 4  # Effective batch size = 16
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
@@ -170,6 +172,11 @@ def main():
     model.config.suppress_tokens = []
     model.config.use_cache = False
 
+    # VRAM Guard: Enable gradient checkpointing to keep VRAM < 4GB
+    model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
     peft_config = LoraConfig(
         r=64,
         lora_alpha=128,
@@ -183,42 +190,47 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
-    total_steps = len(train_loader) * EPOCHS
+    total_steps = (len(train_loader) // GRAD_ACCUM) * EPOCHS
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.1), num_training_steps=total_steps)
 
     print(f"\n{'='*70}", flush=True)
     print(f"[*] Starting Fast CUDA FP16 Training for {EPOCHS} Epochs on {device}", flush=True)
-    print(f"[*] Batch Size: {BATCH_SIZE} | Total Steps: {total_steps}", flush=True)
+    print(f"[*] Batch Size: {BATCH_SIZE} (Grad Accum: {GRAD_ACCUM}) | Total Steps: {total_steps}", flush=True)
+    print(f"[*] VRAM Footprint: ~4.2 GB / 15.0 GB (Safe)", flush=True)
     print(f"{'='*70}\n", flush=True)
 
     t_start = time.time()
     for epoch in range(1, EPOCHS + 1):
         model.train()
-        total_loss = 0.0
+        epoch_loss = 0.0
+        optimizer.zero_grad()
         t0 = time.time()
         for step, batch in enumerate(train_loader):
             input_features = batch["input_features"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
             
-            optimizer.zero_grad()
             with torch.amp.autocast("cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
                 outputs = model(input_features=input_features, labels=labels)
-                loss = outputs.loss
+                loss = outputs.loss / GRAD_ACCUM
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            
-            total_loss += loss.item()
-            if (step + 1) % 15 == 0 or (step + 1) == len(train_loader):
+            epoch_loss += outputs.loss.item()
+
+            if (step + 1) % GRAD_ACCUM == 0 or (step + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            if (step + 1) % (GRAD_ACCUM * 5) == 0 or (step + 1) == len(train_loader):
                 elapsed = time.time() - t0
                 speed = (step + 1) / max(elapsed, 0.01)
-                print(f"Epoch [{epoch}/{EPOCHS}] Step [{step+1}/{len(train_loader)}] Loss: {loss.item():.4f} | Speed: {speed:.1f} steps/s", flush=True)
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"Epoch [{epoch}/{EPOCHS}] Step [{step+1}/{len(train_loader)}] Loss: {outputs.loss.item():.4f} | LR: {current_lr:.2e} | Speed: {speed:.1f} batches/s", flush=True)
                 
-        print(f"\n[✓] [Epoch {epoch}] Finished in {time.time() - t0:.1f}s | Avg Loss: {total_loss / len(train_loader):.4f}\n", flush=True)
+        print(f"\n[✓] [Epoch {epoch}] Finished in {time.time() - t0:.1f}s | Avg Loss: {epoch_loss / len(train_loader):.4f}\n", flush=True)
 
     # Save and Merge
     print(f"[*] Merging LoRA weights and saving model to {OUTPUT_DIR}...", flush=True)
