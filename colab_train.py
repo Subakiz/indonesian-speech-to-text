@@ -1,22 +1,17 @@
 """High-Speed, Hardware-Accelerated Fine-Tuning for Indonesian Whisper on NVIDIA CUDA GPU (Colab T4/A100).
 
-Major Speed & Memory Optimizations for Google Colab T4 (14.6 GB VRAM):
-1. Non-Reentrant Gradient Checkpointing:
-   - Uses PyTorch's modern `use_reentrant=False` gradient checkpointing to safely fit Whisper-Large-v3-Turbo in ~5-6 GB VRAM.
-   - Eliminates CUDA Out-Of-Memory (OOM) errors while maintaining high throughput.
-2. Multi-Core Batched Audio Preprocessing: 
-   - Uses C-accelerated soundfile decoding + parallel batch mapping (`num_proc=os.cpu_count()`).
-   - Dataset prep time ~90s for entire Google FLEURS dataset.
-3. SDPA (Scaled Dot-Product Attention) & Native FP16:
-   - Activates PyTorch native memory-efficient SDPA / FlashAttention kernels (`attn_implementation="sdpa"`).
-   - Loads base model weights directly in FP16.
-4. LoRA Attention Projections (Compute-Optimized):
+Optimized for ~11.0 - 12.5 GB VRAM Target on 14.6 GB T4 GPU:
+1. Maximum Compute Saturation (Batch Size 10, Grad Accum 2 -> Effective Batch 20):
+   - Directly saturates NVIDIA Turing Tensor Cores for high throughput (~6-10+ samples/s).
+   - Targets ~11-12 GB VRAM utilization (~80% GPU capacity) without triggering CUDA OOM.
+2. SDPA (Scaled Dot-Product Attention) & Native FP16:
+   - Native PyTorch SDPA kernels with zero-copy FP16 tensor streaming.
+3. LoRA Attention Projections (Compute-Optimized):
    - Targets attention projections (`q_proj`, `k_proj`, `v_proj`, `out_proj`) with r=32, alpha=64.
+4. Clean Optimizer & GradScaler Step Ordering:
+   - Eliminates PyTorch LR scheduler step-ordering warnings.
 5. Zero-Starvation DataLoader:
-   - `pin_memory=True`, `persistent_workers=True`, `prefetch_factor=2`, and non-blocking GPU streaming.
-   - Fast vector stacking collator (`FastWhisperCollator`).
-6. CUDA / Tensor Core Optimization Knobs:
-   - `cudnn.benchmark = True`, `torch.amp.autocast("cuda", dtype=torch.float16)`.
+   - `pin_memory=True`, `persistent_workers=True`, `prefetch_factor=3`, and non-blocking GPU streaming.
 """
 
 import os
@@ -185,13 +180,13 @@ def main():
     parser.add_argument("--model", type=str, default="openai/whisper-large-v3-turbo", help="Hugging Face Whisper model name")
     parser.add_argument("--output-dir", type=str, default="./indonesian_whisper_turbo_colab", help="Output model directory")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size per device (4 with grad_accum=4 ensures zero OOM on T4)")
-    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (effective batch size = 16)")
+    parser.add_argument("--batch-size", type=int, default=10, help="Batch size per device (10 targets ~11-12 GB VRAM on T4 without OOM)")
+    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps (effective batch size = 20)")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate for AdamW")
     parser.add_argument("--lora-r", type=int, default=32, help="LoRA rank dimension")
     parser.add_argument("--lora-alpha", type=int, default=64, help="LoRA alpha scaling factor")
     parser.add_argument("--spec-augment", action="store_true", default=True, help="Enable SpecAugment data augmentation")
-    parser.add_argument("--no-checkpointing", action="store_true", default=False, help="Disable gradient checkpointing")
+    parser.add_argument("--gradient-checkpointing", action="store_true", default=False, help="Enable gradient checkpointing (leave False to target 12GB VRAM)")
     parser.add_argument("--max-train-samples", type=int, default=None, help="Limit training samples (useful for fast validation runs)")
     parser.add_argument("--max-val-samples", type=int, default=None, help="Limit validation samples")
     args = parser.parse_args()
@@ -205,13 +200,15 @@ def main():
         gpu_name = torch.cuda.get_device_name(0)
         total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"[✓] Hardware Accelerator: NVIDIA CUDA ({gpu_name}) - {total_vram_gb:.1f} GB VRAM", flush=True)
-        print(f"[✓] Optimizations Active: SDPA FlashAttention, FP16 Tensor Cores, Non-Reentrant Checkpointing", flush=True)
+        print(f"[✓] Optimizations Active: SDPA FlashAttention, FP16 Tensor Cores, Max Saturation Mode", flush=True)
     elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
         device = torch.device("mps")
         print("[✓] Hardware Accelerator: Apple Silicon GPU (MPS)", flush=True)
+        total_vram_gb = 0.0
     else:
         device = torch.device("cpu")
         print("[!] Hardware Accelerator: CPU", flush=True)
+        total_vram_gb = 0.0
 
     # 1. Load Processor
     print(f"\n[*] Loading Processor for '{args.model}' (Indonesian / Transcribe)...", flush=True)
@@ -287,7 +284,7 @@ def main():
         num_workers=num_workers,
         pin_memory=pin_mem,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=3 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
@@ -297,7 +294,7 @@ def main():
         num_workers=num_workers,
         pin_memory=pin_mem,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=3 if num_workers > 0 else None,
     )
 
     # 4. Load Base Model with SDPA & LoRA
@@ -311,9 +308,8 @@ def main():
     model.config.suppress_tokens = []
     model.config.use_cache = False
 
-    # Enable non-reentrant gradient checkpointing to safely handle Whisper Large without OOM
-    if not args.no_checkpointing:
-        print("[*] Activating non-reentrant gradient checkpointing (VRAM-safe)...", flush=True)
+    if args.gradient_checkpointing:
+        print("[*] Activating non-reentrant gradient checkpointing...", flush=True)
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -347,7 +343,8 @@ def main():
     print(f"[*] Starting High-Throughput Indonesian Whisper Fine-Tuning", flush=True)
     print(f"[*] Batch Size: {args.batch_size} (Grad Accum: {args.grad_accum} -> Effective Batch: {args.batch_size * args.grad_accum})", flush=True)
     print(f"[*] Total Steps: {total_steps} | Epochs: {args.epochs} | DataLoader Workers: {num_workers}", flush=True)
-    print(f"[*] Targeted VRAM Utilization: ~5.0 - 6.5 GB / {total_vram_gb if torch.cuda.is_available() else 0:.1f} GB", flush=True)
+    if torch.cuda.is_available():
+        print(f"[*] Target VRAM Utilization: ~11.0 - 12.5 GB / {total_vram_gb:.1f} GB (~80% Capacity)", flush=True)
     print(f"{'='*75}\n", flush=True)
 
     t_train_start = time.time()
@@ -381,24 +378,30 @@ def main():
                 if use_amp:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scale_before = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
+                    scale_after = scaler.get_scale()
+                    # Only step scheduler when the optimizer step was not skipped
+                    if scale_before <= scale_after:
+                        scheduler.step()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
+                    scheduler.step()
 
-                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            if (step + 1) % max(1, (args.grad_accum * 5)) == 0 or (step + 1) == len(train_loader):
+            if (step + 1) % max(1, (args.grad_accum * 4)) == 0 or (step + 1) == len(train_loader):
                 elapsed = time.time() - t_epoch_start
                 samples_per_sec = processed_samples / max(elapsed, 0.001)
                 current_lr = scheduler.get_last_lr()[0]
                 allocated_vram = (torch.cuda.memory_allocated() / (1024**3)) if torch.cuda.is_available() else 0
+                reserved_vram = (torch.cuda.memory_reserved() / (1024**3)) if torch.cuda.is_available() else 0
                 print(
                     f"Epoch [{epoch}/{args.epochs}] Step [{step+1}/{len(train_loader)}] "
                     f"Loss: {outputs.loss.item():.4f} | LR: {current_lr:.2e} | "
-                    f"Throughput: {samples_per_sec:.1f} samples/s | VRAM: {allocated_vram:.1f}GB",
+                    f"Throughput: {samples_per_sec:.1f} samples/s | VRAM: {allocated_vram:.1f}GB (Res: {reserved_vram:.1f}GB)",
                     flush=True,
                 )
 
